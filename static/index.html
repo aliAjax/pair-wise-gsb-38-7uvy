@@ -1,11 +1,17 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>字幕本地化质检</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>影视字幕本地化质检</h1><p>示例项目已含术语表。分配翻译、时间轴和复核人员后，录入带时间点的字幕与评论，再完成提交、复核、锁定和交付。</p>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}
+table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #d9e1e8;padding:6px 8px;text-align:left;vertical-align:top}th{background:#eef3f7}
+.bad{background:#fdecec}.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-right:6px}.tag.ready{background:#e2f4e5;color:#1c7a32}.tag.blocked{background:#fbe0e0;color:#a02020}.tag.delivered{background:#e0e8fb;color:#23409b}.issue{color:#a02020;font-size:13px;margin:2px 0}.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}</style></head>
+<body><h1>影视字幕本地化质检</h1><p>示例项目已含术语表。分配翻译、时间轴和复核人员后，录入带时间点的字幕与评论，再完成提交、复核、锁定和交付。同一语言版本可按平台帧率（25 / 23.976）生成各自的交付规格，原时码与换算后时码并排核对。</p>
 <div class="card"><h2>身份与版本</h2><input id="user" value="alice"><select id="role"><option>owner</option><option>reviewer</option><option>translator</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button><pre id="data">等待刷新…</pre></div>
 <div class="card"><h2>录入字幕</h2><textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea><button onclick="saveCue()">保存字幕</button><pre id="cueResult"></pre></div>
 <div class="card"><h2>时间点评论</h2><input id="time" type="number" value="1200"><input id="comment" value="请复核这里的术语"><button onclick="addComment()">添加评论</button><pre id="commentResult"></pre></div>
 <div class="card"><h2>状态流转</h2><button onclick="action('submit')">提交复核</button><button onclick="review('approve')">复核通过</button><button onclick="review('reject')">退回修改</button><button onclick="action('lock')">锁定</button><button onclick="action('deliver')">交付</button><pre id="stateResult"></pre></div>
+<div class="card"><h2>平台交付规格</h2>
+<p><small>帧保持换算：24→25 成片加速 4%，24→23.976 放慢 0.1%。换算后出现重叠、越界或空时长的句子会列出问题句号，规格标记为“阻断”，无法交付。规格生成时快照原时间轴，之后原内容再改也不影响已保存的规格。</small></p>
+平台 <input id="plat" value="PAL 电视台"> 源帧率 <select id="srcFps"><option>24</option><option>25</option><option>23.976</option></select> 目标帧率 <select id="dstFps"><option>25</option><option>23.976</option><option>24</option><option>29.97</option><option>30</option></select>
+<button onclick="createSpec()">生成规格</button><div id="specs"></div></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
 async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
@@ -13,5 +19,17 @@ async function saveCue(){try{cueResult.textContent=JSON.stringify(await call('/a
 async function addComment(){try{commentResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/comments',{method:'POST',headers:auth(),body:JSON.stringify({time_ms:+time.value,body:comment.value})}),null,2)}catch(e){commentResult.textContent=e.message}}
 async function action(name){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
 async function review(decision){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/review',{method:'POST',headers:auth(),body:JSON.stringify({decision,comment:''})}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
-async function refresh(){try{const [p,v,c,cm,d]=await Promise.all(['/api/projects','/api/versions','/api/versions/'+version.value+'/cues','/api/versions/'+version.value+'/comments','/api/deliveries'].map(call));data.textContent=JSON.stringify({p,v,c,cm,d},null,2)}catch(e){data.textContent=e.message}}
+function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+async function createSpec(){try{const j=await call('/api/versions/'+version.value+'/platform-specs',{method:'POST',headers:auth(),body:JSON.stringify({platform_name:plat.value,source_fps:srcFps.value,target_fps:dstFps.value})});await showSpec(j.id)}catch(e){specs.textContent=e.message}}
+async function deliverSpec(id){try{await call('/api/platform-specs/'+id+'/deliver',{method:'POST',headers:auth(),body:'{}'});refresh()}catch(e){alert(e.message)}}
+async function showSpec(id){const s=await call('/api/platform-specs/'+id);const bad=new Set(s.issues.map(i=>i.cue_index));
+let h='<h3>'+esc(s.platform_name)+' <span class="tag '+s.status+'">'+({ready:'可交付',blocked:'阻断',delivered:'已交付'}[s.status])+'</span> <small>规格#'+s.id+' 源帧率 '+esc(s.source_fps)+' → 目标帧率 '+esc(s.target_fps)+'，基于版本修订 r'+s.source_revision+'，生成于 '+esc(s.created_at)+'</small></h3>';
+if(s.issues.length){h+='<div class="issue"><b>问题句（已阻止交付）：</b><br>'+s.issues.map(i=>esc(i.message)).join('<br>')+'</div>'}
+h+='<table><tr><th>#</th><th>原时码（源帧率）</th><th>新时码（目标帧率）</th><th>文字</th></tr>';
+h+=s.cues.map(c=>'<tr class="'+(bad.has(c.cue_index)?'bad':'')+'"><td>'+c.cue_index+'</td><td class="mono">'+esc(c.orig_timecode)+'<br><small>'+c.orig_start_ms+'→'+c.orig_end_ms+' ms</small></td><td class="mono">'+esc(c.new_timecode)+'<br><small>'+c.new_start_ms+'→'+c.new_end_ms+' ms</small></td><td>'+esc(c.text)+'</td></tr>').join('');
+h+='</table>';if(s.status!=='delivered')h+='<button onclick="deliverSpec('+s.id+')">交付该平台规格</button>';
+specs.innerHTML=h}
+async function refresh(){try{const [p,v,c,cm,d,sp]=await Promise.all(['/api/projects','/api/versions','/api/versions/'+version.value+'/cues','/api/versions/'+version.value+'/comments','/api/deliveries','/api/platform-specs?version_id='+version.value].map(call));data.textContent=JSON.stringify({p,v,c,cm,d},null,2);
+specs.innerHTML=sp.specs.map(s=>'<div><span class="tag '+s.status+'">'+({ready:'可交付',blocked:'阻断',delivered:'已交付'}[s.status])+'</span> <b>'+esc(s.platform_name)+'</b> '+esc(s.source_fps)+'→'+esc(s.target_fps)+' <small>问题 '+s.issue_count+' 句 · r'+s.source_revision+'</small> <button onclick="showSpec('+s.id+')">查看</button></div>').join('') || '<small>该版本暂无平台规格</small>'}catch(e){data.textContent=e.message}}
+refresh();
 </script></body></html>

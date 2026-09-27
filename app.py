@@ -4,16 +4,123 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "subtitle_qc.db"
+
+# Broadcast frame rates are rational: 23.976 fps is exactly 24000/1001.
+# (num, den, nominal_timecode_fps)
+KNOWN_FPS: dict[str, tuple[int, int, int]] = {
+    "23.976": (24000, 1001, 24),
+    "23.98": (24000, 1001, 24),
+    "24": (24, 1, 24),
+    "25": (25, 1, 25),
+    "29.97": (30000, 1001, 30),
+    "30": (30, 1, 30),
+    "59.94": (60000, 1001, 60),
+    "60": (60, 1, 60),
+}
+
+
+def parse_fps(value: Any) -> tuple[int, int, int]:
+    """Return (fps_num, fps_den, nominal_tc_fps) for common broadcast rates."""
+    text = str(value).strip()
+    if not text:
+        raise DomainError("帧率不能为空")
+    if text in KNOWN_FPS:
+        return KNOWN_FPS[text]
+    try:
+        fps = float(text)
+    except ValueError as exc:
+        raise DomainError(f"不支持的帧率: {text}") from exc
+    if not math.isfinite(fps) or fps <= 0 or fps > 240:
+        raise DomainError(f"不支持的帧率: {text}")
+    if abs(fps - round(fps)) < 1e-9:
+        rate = int(round(fps))
+        return (rate, 1, rate)
+    # NTSC-style rates run 0.1% slow: nominal n is encoded as (1000n)/1001.
+    nominal = int(round(fps * 1001 / 1000))
+    candidate = nominal * 1000
+    if abs(candidate / 1001 - fps) < 1e-6:
+        return (candidate, 1001, nominal)
+    raise DomainError(f"不支持的帧率: {text}（可用 24/25/23.976 等常用帧率）")
+
+
+def frame_at(ms: int, fps: tuple[int, int, int]) -> int:
+    num, den, _ = fps
+    return int(ms * num / (1000 * den) + 0.5)
+
+
+def frame_to_ms(frame: int, fps: tuple[int, int, int]) -> float:
+    num, den, _ = fps
+    return round(frame * 1000 * den / num, 3)
+
+
+def format_timecode(frame: int, nominal_fps: int) -> str:
+    total, ff = divmod(int(frame), nominal_fps)
+    hh, rem = divmod(total, 3600)
+    mm, ss = divmod(rem, 60)
+    return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+
+
+def convert_timeline(
+    cues: list[dict[str, Any]],
+    source_fps: tuple[int, int, int],
+    target_fps: tuple[int, int, int],
+    duration_ms: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Frame-preserving respeed (24 -> 25 PAL, 24 -> 23.976 NTSC).
+
+    Returns converted cue rows and validation issues. The media only contains
+    whole frames, so its last valid frame is floor(duration * fps).
+    """
+    total_frames = int(duration_ms * source_fps[0] / (1000 * source_fps[1]))
+    rows: list[dict[str, Any]] = []
+    for cue in cues:
+        osf = frame_at(int(cue["start_ms"]), source_fps)
+        oef = frame_at(int(cue["end_ms"]), source_fps)
+        # Frame count is preserved; wall-clock position shifts with the rate.
+        nsf, nef = osf, oef
+        rows.append({
+            "cue_index": int(cue["cue_index"]),
+            "orig_start_ms": int(cue["start_ms"]),
+            "orig_end_ms": int(cue["end_ms"]),
+            "orig_start_frame": osf,
+            "orig_end_frame": oef,
+            "new_start_frame": nsf,
+            "new_end_frame": nef,
+            "new_start_ms": frame_to_ms(nsf, target_fps),
+            "new_end_ms": frame_to_ms(nef, target_fps),
+            "text": cue["text"],
+        })
+
+    issues: list[dict[str, Any]] = []
+    for row in rows:
+        idx = row["cue_index"]
+        if row["new_end_frame"] <= row["new_start_frame"]:
+            issues.append({"cue_index": idx, "related_index": None, "kind": "empty_duration",
+                           "message": f"第 {idx} 句换算后起止都落在第 {row['new_start_frame']} 帧，空时长"})
+        if row["new_start_frame"] >= total_frames or row["new_end_frame"] > total_frames:
+            issues.append({"cue_index": idx, "related_index": None, "kind": "out_of_bounds",
+                           "message": f"第 {idx} 句换算后结束帧 {row['new_end_frame']} 越过成片末帧 {total_frames}，越界"})
+    ordered = sorted(rows, key=lambda r: (r["new_start_frame"], r["cue_index"]))
+    for prev, nxt in zip(ordered, ordered[1:]):
+        if nxt["new_start_frame"] < prev["new_end_frame"]:
+            a, b = prev["cue_index"], nxt["cue_index"]
+            issues.append({"cue_index": a, "related_index": b, "kind": "overlap",
+                           "message": f"第 {a} 句与第 {b} 句换算后时间轴重叠"})
+            issues.append({"cue_index": b, "related_index": a, "kind": "overlap",
+                           "message": f"第 {b} 句与第 {a} 句换算后时间轴重叠"})
+    issues.sort(key=lambda i: (i["cue_index"], i["kind"]))
+    return rows, issues
 
 
 def utcnow() -> str:
@@ -130,6 +237,43 @@ class Database:
                     entity_id INTEGER,
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS platform_specs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    platform_name TEXT NOT NULL,
+                    source_fps TEXT NOT NULL,
+                    target_fps TEXT NOT NULL,
+                    source_revision INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ready' CHECK(status IN ('ready','blocked','delivered')),
+                    snapshot_hash TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    delivered_by TEXT,
+                    delivered_at TEXT,
+                    UNIQUE(version_id,platform_name,target_fps)
+                );
+                CREATE TABLE IF NOT EXISTS platform_spec_cues (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    spec_id INTEGER NOT NULL REFERENCES platform_specs(id) ON DELETE CASCADE,
+                    cue_index INTEGER NOT NULL,
+                    orig_start_ms INTEGER NOT NULL,
+                    orig_end_ms INTEGER NOT NULL,
+                    orig_start_frame INTEGER NOT NULL,
+                    orig_end_frame INTEGER NOT NULL,
+                    new_start_frame INTEGER NOT NULL,
+                    new_end_frame INTEGER NOT NULL,
+                    new_start_ms REAL NOT NULL,
+                    new_end_ms REAL NOT NULL,
+                    text TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS platform_spec_issues (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    spec_id INTEGER NOT NULL REFERENCES platform_specs(id) ON DELETE CASCADE,
+                    cue_index INTEGER NOT NULL,
+                    related_index INTEGER,
+                    kind TEXT NOT NULL CHECK(kind IN ('overlap','out_of_bounds','empty_duration')),
+                    message TEXT NOT NULL
                 );
                 """
             )
@@ -383,6 +527,125 @@ class Database:
             self._audit(conn, actor, "version.delivered", "version", version_id, {"snapshot_hash": snapshot_hash})
         return dict(conn.execute("SELECT * FROM deliveries WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def create_spec(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        platform = str(payload.get("platform_name", "")).strip()
+        if not platform:
+            raise DomainError("平台名称不能为空")
+        source_fps = parse_fps(payload.get("source_fps", 24))
+        target_fps = parse_fps(payload.get("target_fps"))
+        if source_fps == target_fps:
+            raise DomainError("目标帧率与源帧率相同，无需建立交付规格")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = self._version(conn, version_id)
+            if actor != version["owner"] and role != "admin":
+                raise DomainError("只有项目负责人可以建立平台交付规格", 403)
+            cues = [dict(r) for r in conn.execute(
+                "SELECT cue_index,start_ms,end_ms,text FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,))]
+            if not cues:
+                raise DomainError("版本还没有字幕，不能生成平台规格", 409)
+            rows, issues = convert_timeline(cues, source_fps, target_fps, int(version["duration_ms"]))
+            src_label = str(payload.get("source_fps", 24)).strip()
+            tgt_label = str(payload.get("target_fps")).strip()
+            snapshot = {
+                "platform_name": platform,
+                "source_fps": src_label,
+                "target_fps": tgt_label,
+                "source_revision": int(version["revision"]),
+                "cues": rows,
+                "issues": issues,
+            }
+            snapshot_hash = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            status = "blocked" if issues else "ready"
+            try:
+                cur = conn.execute(
+                    """INSERT INTO platform_specs(version_id,platform_name,source_fps,target_fps,source_revision,
+                       status,snapshot_hash,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (version_id, platform, src_label, tgt_label, int(version["revision"]),
+                     status, snapshot_hash, actor, utcnow()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该平台规格已存在（同版本、平台与目标帧率唯一）", 409) from exc
+            spec_id = int(cur.lastrowid)
+            conn.executemany(
+                """INSERT INTO platform_spec_cues(spec_id,cue_index,orig_start_ms,orig_end_ms,orig_start_frame,
+                   orig_end_frame,new_start_frame,new_end_frame,new_start_ms,new_end_ms,text)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                [(spec_id, r["cue_index"], r["orig_start_ms"], r["orig_end_ms"], r["orig_start_frame"],
+                  r["orig_end_frame"], r["new_start_frame"], r["new_end_frame"], r["new_start_ms"],
+                  r["new_end_ms"], r["text"]) for r in rows],
+            )
+            conn.executemany(
+                "INSERT INTO platform_spec_issues(spec_id,cue_index,related_index,kind,message) VALUES(?,?,?,?,?)",
+                [(spec_id, i["cue_index"], i["related_index"], i["kind"], i["message"]) for i in issues],
+            )
+            self._audit(conn, actor, "platformspec.created", "platform_spec", spec_id,
+                        {"platform": platform, "target_fps": tgt_label, "status": status, "issues": len(issues)})
+        return self.get_spec(spec_id)
+
+    def get_spec(self, spec_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            spec = conn.execute("SELECT * FROM platform_specs WHERE id=?", (spec_id,)).fetchone()
+            if not spec:
+                raise DomainError("平台交付规格不存在", 404)
+            cues_raw = [dict(r) for r in conn.execute(
+                "SELECT * FROM platform_spec_cues WHERE spec_id=? ORDER BY cue_index", (spec_id,))]
+            issues = [dict(r) for r in conn.execute(
+                "SELECT cue_index,related_index,kind,message FROM platform_spec_issues WHERE spec_id=? ORDER BY id", (spec_id,))]
+        target_nominal = parse_fps(spec["target_fps"])[2]
+        source_nominal = parse_fps(spec["source_fps"])[2]
+        cues = []
+        for row in cues_raw:
+            row["orig_timecode"] = format_timecode(row["orig_start_frame"], source_nominal) + " --> " + format_timecode(row["orig_end_frame"], source_nominal)
+            row["new_timecode"] = format_timecode(row["new_start_frame"], target_nominal) + " --> " + format_timecode(row["new_end_frame"], target_nominal)
+            row["text"] = row["text"]
+            cues.append(row)
+        return dict(spec) | {"cues": cues, "issues": issues,
+                             "issue_count": len(issues), "blocked": bool(issues)}
+
+    def list_specs(self, version_id: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if version_id:
+                rows = conn.execute(
+                    """SELECT s.*,COUNT(i.id) issue_count FROM platform_specs s
+                       LEFT JOIN platform_spec_issues i ON i.spec_id=s.id
+                       WHERE s.version_id=? GROUP BY s.id ORDER BY s.id DESC""", (version_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT s.*,COUNT(i.id) issue_count FROM platform_specs s
+                       LEFT JOIN platform_spec_issues i ON i.spec_id=s.id
+                       GROUP BY s.id ORDER BY s.id DESC""").fetchall()
+            result = []
+            for row in rows:
+                d = dict(row)
+                d["blocked"] = d["status"] == "blocked"
+                result.append(d)
+            return result
+
+    def deliver_spec(self, spec_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            spec = conn.execute(
+                """SELECT s.*,v.status AS version_status,v.project_id,p.owner,p.duration_ms
+                   FROM platform_specs s JOIN versions v ON v.id=s.version_id
+                   JOIN projects p ON p.id=v.project_id WHERE s.id=?""", (spec_id,)).fetchone()
+            if not spec:
+                raise DomainError("平台交付规格不存在", 404)
+            if actor != spec["owner"] and role != "admin":
+                raise DomainError("只有项目负责人可以交付平台规格", 403)
+            if spec["status"] == "blocked":
+                count = int(conn.execute("SELECT COUNT(*) c FROM platform_spec_issues WHERE spec_id=?", (spec_id,)).fetchone()["c"])
+                raise DomainError(f"规格存在 {count} 个问题句（重叠/越界/空时长），已阻止交付，请修正时间轴后重新生成", 409)
+            if spec["status"] == "delivered":
+                raise DomainError("该平台规格已经交付，不能重复交付", 409)
+            if spec["version_status"] not in {"approved", "locked", "delivered"}:
+                raise DomainError("关联版本尚未通过复核，不能交付平台规格", 409)
+            conn.execute("UPDATE platform_specs SET status='delivered',delivered_by=?,delivered_at=? WHERE id=?",
+                         (actor, utcnow(), spec_id))
+            self._audit(conn, actor, "platformspec.delivered", "platform_spec", spec_id,
+                        {"platform": spec["platform_name"], "snapshot_hash": spec["snapshot_hash"]})
+        return self.get_spec(spec_id)
+
     def list_projects(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM projects ORDER BY id").fetchall()]
@@ -466,6 +729,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"versions": self.db.list_versions()})
             if parsed.path == "/api/deliveries":
                 return self._send({"deliveries": self.db.list_deliveries()})
+            if parsed.path == "/api/platform-specs":
+                qs = parse_qs(parsed.query)
+                version_id = int(qs["version_id"][0]) if qs.get("version_id") else None
+                return self._send({"specs": self.db.list_specs(version_id)})
+            spec_parts = [p for p in parsed.path.split("/") if p]
+            if len(spec_parts) == 3 and spec_parts[:2] == ["api", "platform-specs"]:
+                return self._send(self.db.get_spec(int(spec_parts[2])))
             if parsed.path == "/api/audit":
                 return self._send({"audit": self.db.audit()})
             parts = [p for p in parsed.path.split("/") if p]
@@ -495,6 +765,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.save_cue(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send(self.db.add_comment(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "platform-specs":
+                return self._send(self.db.create_spec(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "platform-specs"] and parts[3] == "deliver":
+                return self._send(self.db.deliver_spec(int(parts[2]), actor, role))
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "lock", "deliver"}:
                 version_id = int(parts[2])
                 if parts[3] == "submit":
