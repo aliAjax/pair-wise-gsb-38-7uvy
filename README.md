@@ -20,6 +20,7 @@ python app.py --port 8009
 5. 翻译/时间轴成员提交复核，分配的非创建人复核人批准或退回。
 6. 负责人锁定已批准版本，再执行交付。
 7. 交付时生成确定性的 SHA-256 快照；同语言的新交付会把旧版本标记为 `superseded`，但旧快照不会删除或覆盖。
+8. 同一语言版本需要发给不同帧率平台时，负责人为每个平台建立交付规格：按项目成片帧率（`frame_rate`，默认 25）换算到目标帧率，保存换算后的起止时间和平台片长。规格页面把句号、原时码、新时码和文字并排展示；换算后出现重叠、越界或空时长会标出句号并把规格标记为 `blocked`，阻止该规格交付。规格生成即快照，原版本之后再改字幕不影响已保存结果（规格记录当时的 `source_revision`），同一平台可多次生成递增序号的规格，多个规格可分别查询和交付。
 
 字幕保存会验证时长范围、起点小于终点、字幕重叠、序号冲突和术语表。术语表中配置的禁用译法会直接阻止保存；指定译法可用。
 
@@ -34,6 +35,9 @@ python app.py --port 8009
 - `POST /api/versions/{id}/cues`：新增或修改字幕，要求 `expected_revision`。
 - `POST /api/versions/{id}/comments`：按具体时间毫秒或字幕 ID 评论。
 - `POST /api/versions/{id}/submit|review|lock|deliver`：完成审核交付状态机。
+- `POST /api/versions/{id}/specs`：为平台建立交付规格（`platform`、`target_fps`，可选 `media_duration_ms`），保存帧率和换算后的起止时间快照。
+- `GET /api/versions/{id}/specs`、`GET /api/specs/{id}`：分别查询多个规格；单条规格返回原时码、新时码和文字并排的逐句结果及阻断问题。
+- `POST /api/specs/{id}/deliver`：交付规格；存在重叠、越界或空时长问题时返回 409 并指出句号。
 - `GET /api/versions/{id}/cues|comments`、`GET /api/deliveries`：查看结果。
 
 ## 测试
@@ -42,4 +46,4 @@ python app.py --port 8009
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖完整复核交付流程、锁定覆盖保护、旧修订冲突、时间轴重叠、术语禁用和人员权限。
+测试覆盖完整复核交付流程、锁定覆盖保护、旧修订冲突、时间轴重叠、术语禁用和人员权限，以及交付规格的帧率换算、快照保留、重叠/越界/空时长阻断和多规格分别查询。

@@ -50,6 +50,7 @@ class Database:
                     owner TEXT NOT NULL,
                     media_name TEXT NOT NULL,
                     media_sha256 TEXT NOT NULL,
+                    frame_rate REAL NOT NULL DEFAULT 25.0,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS versions (
@@ -122,6 +123,35 @@ class Database:
                     delivered_by TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS delivery_specs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    platform TEXT NOT NULL,
+                    spec_no INTEGER NOT NULL,
+                    source_fps REAL NOT NULL,
+                    target_fps REAL NOT NULL,
+                    media_duration_ms INTEGER NOT NULL CHECK(media_duration_ms > 0),
+                    status TEXT NOT NULL DEFAULT 'ready',
+                    issues TEXT NOT NULL DEFAULT '[]',
+                    source_revision INTEGER NOT NULL DEFAULT 0,
+                    snapshot_hash TEXT,
+                    delivered_by TEXT,
+                    delivered_at TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(version_id,platform,spec_no)
+                );
+                CREATE TABLE IF NOT EXISTS delivery_spec_rows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    spec_id INTEGER NOT NULL REFERENCES delivery_specs(id) ON DELETE CASCADE,
+                    cue_index INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    orig_start_ms INTEGER NOT NULL,
+                    orig_end_ms INTEGER NOT NULL,
+                    new_start_ms INTEGER NOT NULL,
+                    new_end_ms INTEGER NOT NULL,
+                    UNIQUE(spec_id,cue_index)
+                );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     actor TEXT NOT NULL,
@@ -133,6 +163,9 @@ class Database:
                 );
                 """
             )
+            project_cols = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
+            if "frame_rate" not in project_cols:
+                conn.execute("ALTER TABLE projects ADD COLUMN frame_rate REAL NOT NULL DEFAULT 25.0")
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -152,13 +185,19 @@ class Database:
             duration_ms = int(payload.get("duration_ms"))
         except (TypeError, ValueError) as exc:
             raise DomainError("成片时长必须是毫秒整数") from exc
+        try:
+            frame_rate = float(payload.get("frame_rate", 25.0))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("成片帧率必须是数字") from exc
         if not name or not source_language or not media_name or duration_ms <= 0 or len(media_sha) != 64:
             raise DomainError("项目名称、源语言、成片、时长或校验值不完整")
+        if not 0 < frame_rate <= 240:
+            raise DomainError("成片帧率不合法")
         with self.connect() as conn:
             try:
                 cur = conn.execute(
-                    "INSERT INTO projects(name,source_language,duration_ms,owner,media_name,media_sha256,created_at) VALUES(?,?,?,?,?,?,?)",
-                    (name, source_language, duration_ms, actor, media_name, media_sha, utcnow()),
+                    "INSERT INTO projects(name,source_language,duration_ms,owner,media_name,media_sha256,frame_rate,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (name, source_language, duration_ms, actor, media_name, media_sha, frame_rate, utcnow()),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("项目名称已存在", 409) from exc
@@ -226,7 +265,7 @@ class Database:
         return {"version_id": version_id, "user": user, "role": assignment_role}
 
     def _version(self, conn: sqlite3.Connection, version_id: int) -> sqlite3.Row:
-        row = conn.execute("SELECT v.*,p.owner,p.duration_ms FROM versions v JOIN projects p ON p.id=v.project_id WHERE v.id=?", (version_id,)).fetchone()
+        row = conn.execute("SELECT v.*,p.owner,p.duration_ms,p.frame_rate FROM versions v JOIN projects p ON p.id=v.project_id WHERE v.id=?", (version_id,)).fetchone()
         if not row:
             raise DomainError("字幕版本不存在", 404)
         return row
@@ -383,6 +422,147 @@ class Database:
             self._audit(conn, actor, "version.delivered", "version", version_id, {"snapshot_hash": snapshot_hash})
         return dict(conn.execute("SELECT * FROM deliveries WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    @staticmethod
+    def _round_half_up(value: float) -> int:
+        return int(value + 0.5)
+
+    @classmethod
+    def _convert_ms(cls, ms: int, source_fps: float, target_fps: float) -> int:
+        # 先对齐到源帧率下的帧号，再按目标帧率折算回毫秒，保证帧级对应关系。
+        frame = cls._round_half_up(ms * source_fps / 1000)
+        return cls._round_half_up(frame * 1000 / target_fps)
+
+    @staticmethod
+    def _validate_spec_rows(rows: list[dict[str, Any]], media_duration_ms: int) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        for row in rows:
+            cue_index = row["cue_index"]
+            if row["new_end_ms"] <= row["new_start_ms"]:
+                issues.append({"cue_index": cue_index, "type": "empty_duration",
+                               "message": f"第{cue_index}句换算后时长为空（{row['new_start_ms']}–{row['new_end_ms']} 毫秒）"})
+            if row["new_start_ms"] < 0 or row["new_end_ms"] > media_duration_ms:
+                issues.append({"cue_index": cue_index, "type": "out_of_bounds",
+                               "message": f"第{cue_index}句换算后越界（平台片长 {media_duration_ms} 毫秒）"})
+        ordered = sorted(rows, key=lambda r: (r["new_start_ms"], r["cue_index"]))
+        for prev, cur in zip(ordered, ordered[1:]):
+            if cur["new_start_ms"] < prev["new_end_ms"]:
+                issues.append({"cue_index": cur["cue_index"], "type": "overlap",
+                               "message": f"第{cur['cue_index']}句与第{prev['cue_index']}句换算后重叠"})
+        return issues
+
+    def create_spec(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        platform = str(payload.get("platform", "")).strip()
+        if not platform:
+            raise DomainError("平台名称不能为空")
+        try:
+            target_fps = float(payload.get("target_fps"))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("目标帧率必须是数字") from exc
+        if not 0 < target_fps <= 240:
+            raise DomainError("目标帧率不合法")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = self._version(conn, version_id)
+            if actor != version["owner"] and role != "admin":
+                raise DomainError("只有项目负责人可以建立交付规格", 403)
+            cues = [dict(r) for r in conn.execute("SELECT cue_index,start_ms,end_ms,text FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,))]
+            if not cues:
+                raise DomainError("版本还没有字幕，无法生成交付规格", 409)
+            source_fps = float(version["frame_rate"])
+            media_duration = payload.get("media_duration_ms")
+            if media_duration is None:
+                media_duration_ms = self._convert_ms(int(version["duration_ms"]), source_fps, target_fps)
+            else:
+                try:
+                    media_duration_ms = int(media_duration)
+                except (TypeError, ValueError) as exc:
+                    raise DomainError("平台片长必须是毫秒整数") from exc
+                if media_duration_ms <= 0:
+                    raise DomainError("平台片长不合法")
+            rows = [{
+                "cue_index": cue["cue_index"],
+                "text": cue["text"],
+                "orig_start_ms": cue["start_ms"],
+                "orig_end_ms": cue["end_ms"],
+                "new_start_ms": self._convert_ms(cue["start_ms"], source_fps, target_fps),
+                "new_end_ms": self._convert_ms(cue["end_ms"], source_fps, target_fps),
+            } for cue in cues]
+            issues = self._validate_spec_rows(rows, media_duration_ms)
+            status = "blocked" if issues else "ready"
+            spec_no = int(conn.execute("SELECT COALESCE(MAX(spec_no),0)+1 value FROM delivery_specs WHERE version_id=? AND platform=?", (version_id, platform)).fetchone()["value"])
+            cur = conn.execute(
+                """INSERT INTO delivery_specs(version_id,platform,spec_no,source_fps,target_fps,media_duration_ms,status,issues,source_revision,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (version_id, platform, spec_no, source_fps, target_fps, media_duration_ms, status,
+                 json.dumps(issues, ensure_ascii=False), int(version["revision"]), actor, utcnow()),
+            )
+            spec_id = int(cur.lastrowid)
+            for row in rows:
+                conn.execute(
+                    "INSERT INTO delivery_spec_rows(spec_id,cue_index,text,orig_start_ms,orig_end_ms,new_start_ms,new_end_ms) VALUES(?,?,?,?,?,?,?)",
+                    (spec_id, row["cue_index"], row["text"], row["orig_start_ms"], row["orig_end_ms"], row["new_start_ms"], row["new_end_ms"]),
+                )
+            self._audit(conn, actor, "spec.created", "spec", spec_id,
+                        {"platform": platform, "target_fps": target_fps, "status": status, "issue_count": len(issues)})
+        return self.get_spec(spec_id)
+
+    def get_spec(self, spec_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            spec = conn.execute(
+                "SELECT s.*,v.language,v.version_no,v.project_id FROM delivery_specs s JOIN versions v ON v.id=s.version_id WHERE s.id=?",
+                (spec_id,),
+            ).fetchone()
+            if not spec:
+                raise DomainError("交付规格不存在", 404)
+            rows = [dict(r) for r in conn.execute(
+                "SELECT cue_index,text,orig_start_ms,orig_end_ms,new_start_ms,new_end_ms FROM delivery_spec_rows WHERE spec_id=? ORDER BY cue_index",
+                (spec_id,),
+            )]
+        result = dict(spec)
+        result["issues"] = json.loads(result["issues"])
+        result["rows"] = rows
+        return result
+
+    def list_specs(self, version_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            specs = []
+            for row in conn.execute("SELECT * FROM delivery_specs WHERE version_id=? ORDER BY platform,spec_no", (version_id,)):
+                item = dict(row)
+                item["issues"] = json.loads(item["issues"])
+                item["row_count"] = int(conn.execute("SELECT COUNT(*) c FROM delivery_spec_rows WHERE spec_id=?", (item["id"],)).fetchone()["c"])
+                specs.append(item)
+            return specs
+
+    def deliver_spec(self, spec_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            spec = conn.execute(
+                "SELECT s.*,p.owner FROM delivery_specs s JOIN versions v ON v.id=s.version_id JOIN projects p ON p.id=v.project_id WHERE s.id=?",
+                (spec_id,),
+            ).fetchone()
+            if not spec:
+                raise DomainError("交付规格不存在", 404)
+            if actor != spec["owner"] and role != "admin":
+                raise DomainError("只有项目负责人可以交付规格", 403)
+            if spec["status"] == "delivered":
+                raise DomainError("该交付规格已交付，不能重复交付", 409)
+            issues = json.loads(spec["issues"])
+            if spec["status"] == "blocked" or issues:
+                detail = "；".join(issue["message"] for issue in issues)
+                raise DomainError(f"规格存在阻断问题，禁止交付：{detail}", 409)
+            rows = [dict(r) for r in conn.execute(
+                "SELECT cue_index,text,orig_start_ms,orig_end_ms,new_start_ms,new_end_ms FROM delivery_spec_rows WHERE spec_id=? ORDER BY cue_index",
+                (spec_id,),
+            )]
+            manifest = {"spec_id": spec_id, "version_id": spec["version_id"], "platform": spec["platform"],
+                        "source_fps": spec["source_fps"], "target_fps": spec["target_fps"],
+                        "media_duration_ms": spec["media_duration_ms"], "rows": rows}
+            snapshot_hash = hashlib.sha256(json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            conn.execute("UPDATE delivery_specs SET status='delivered',snapshot_hash=?,delivered_by=?,delivered_at=? WHERE id=?",
+                         (snapshot_hash, actor, utcnow(), spec_id))
+            self._audit(conn, actor, "spec.delivered", "spec", spec_id, {"platform": spec["platform"], "snapshot_hash": snapshot_hash})
+        return self.get_spec(spec_id)
+
     def list_projects(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM projects ORDER BY id").fetchall()]
@@ -415,7 +595,7 @@ class Database:
 def seed_demo(db: Database) -> dict[str, int]:
     if db.list_projects():
         return {"project": int(db.list_projects()[0]["id"])}
-    project = db.create_project("alice", {"name": "极地纪录片字幕", "source_language": "en", "media_name": "polar.mp4", "media_sha256": "b" * 64, "duration_ms": 120000}, "owner")
+    project = db.create_project("alice", {"name": "极地纪录片字幕", "source_language": "en", "media_name": "polar.mp4", "media_sha256": "b" * 64, "duration_ms": 120000, "frame_rate": 25.0}, "owner")
     db.set_glossary(project["id"], "alice", {"source_term": "seal", "required_translation": "海豹", "forbidden_terms": ["密封"], "notes": "动物学语境"}, "owner")
     version = db.create_version(project["id"], "alice", {"language": "zh-CN"}, "owner")
     return {"project": int(project["id"]), "version": int(version["id"])}
@@ -473,6 +653,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"cues": self.db.list_cues(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send({"comments": self.db.list_comments(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "specs":
+                return self._send({"specs": self.db.list_specs(int(parts[2]))})
+            if len(parts) == 3 and parts[:2] == ["api", "specs"]:
+                return self._send(self.db.get_spec(int(parts[2])))
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))
@@ -495,6 +679,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.save_cue(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send(self.db.add_comment(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "specs":
+                return self._send(self.db.create_spec(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "specs"] and parts[3] == "deliver":
+                return self._send(self.db.deliver_spec(int(parts[2]), actor, role))
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "lock", "deliver"}:
                 version_id = int(parts[2])
                 if parts[3] == "submit":
